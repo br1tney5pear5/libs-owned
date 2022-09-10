@@ -1,13 +1,54 @@
-/* The purpose of this library 
+/* 
  *
  *
+ * This library aims to minimise mental overhead of 
+ * making different processes talk to each other (IPC).
+ * whether its on the same system or over the network.
  *
  *
+ * Rationale
  *
+ *   IPC is always boilerplate chore and sometimes source 
+ *   of subtle bugs like say you have an edge case where 
+ *   your program will block forever. Or your protocol
+ *   is datagram based but you realise that the maximum
+ *   datagram size isn't enough for you. So you either
+ *   implement segmentation/reassembly or convert it to
+ *   stream and assure message boundaries yourself.
+ *   That's what just comes up to mind rt.
+ *
+ *   So the point of this library is not to be some a 
+ *   glorified socket wrapper or some fancy asynchronous
+ *   webserver grade networking. Instead the goal is 
+ *   a simple interface for a simple thing - talking to 
+ *   other programs. Goal is to be write communication 
+ *   between two programs in 5 minutes and be done with it.
+ *
+ *
+ * Ancillary goals
+ *
+ *   [ ] Be poll-driven. You find in system engineering 
+ *       many daemon program will be based on a central
+ *       loop monitoring file descriptors with something
+ *       like epoll. This library should integrate with 
+ *       this paradigm.
+ *
+ *   [ ] Support UNIX sockets for programs talking to 
+ *       each other on the same system.
+ *
+ *   [ ] Support INET sockets for programs talking to 
+ *       each other over the network.
  *
  * */
 #ifndef _IPTALK_H_
 #define _IPTALK_H_
+
+#define IPTALK_DEBUG_PRINT(...)\
+  do {\
+    fprintf(stderr, "%s:%d: ", __func__, __LINE__);\
+    fprintf(stderr, __VA_ARGS__);\
+    fprintf(stderr, "\n");\
+  } while(0)
 
 #include <sys/types.h>
 #include <sys/socket.h>
@@ -26,10 +67,36 @@
 /* TODO: explain */
 #undef unix
 
+struct iptalk_list_head;
+struct iptalk_config;
+struct iptalk_header;
+struct iptalk_buffer;
+struct iptalk_header;
+struct iptalk;
+
+
 enum {
   IPTALK_INVALID = 0,
   IPTALK_UNIX,
 };
+
+struct iptalk_list_head {
+  struct iptalk_list_head *next;
+  struct iptalk_list_head *prev;
+};
+
+#define iptalk_list_for(POS, HEAD)\
+  for(struct iptalk_list_head *POS = (HEAD)->next;\
+      (POS) != (HEAD);\
+      POS = (POS)->next)
+
+#define iptalk_list_safe_for(POS, HEAD)\
+  for (struct iptalk_list_head *POS = (HEAD)->next, *__next = (POS)->next;\
+      (POS) != (HEAD);\
+       POS = __next, __next = (POS)->next)
+
+#define iptalk_list_empty(LIST) ((LIST)->next == (LIST)->prev)
+
 
 struct iptalk_config {
   int type;
@@ -45,70 +112,285 @@ struct iptalk_config {
   int backlog;
 };
 
+struct iptalk_buffer {
+  struct iptalk_list_head list;
+  void *data;
+  size_t offset;
+  size_t size;
+  struct iptalk_header *header;
+};
+
 struct iptalk_convo {
+  struct iptalk_list_head list;
+  struct iptalk *iptalk;
   int sock;
 
-  size_t buffer_size;
-  size_t buffer_offset;
-  void *buffer;
+  uint8_t flags;
+
+  struct iptalk_buffer *current_buffer;
+  struct iptalk_list_head buffers;
 };
 
 struct iptalk {
   int epoll_sock;
   int sock;
 
-  int num_convos;
-  struct iptalk_convo *convos;
+  struct iptalk_list_head convos;
 
   union {
     struct {
       struct sockaddr_un local; 
       struct sockaddr_un remote; 
+      char tempfile[64];
     } unix;
   };
   struct iptalk_config config;
 };
 
 
+
 #define IPTALK_MESSAGE_MAGIC 0xbeef
 
-struct iptalk_message {
-  uint16_t magic;
-  uint8_t version;
-  uint8_t flags;
-  uint32_t pad[2];
-  uint32_t size;
-  char data[];
+struct iptalk_header {
+  uint16_t magic;   /* Basic protection against bugs in this code really */
+  uint8_t version;  /* Version in case we want to add something to this 
+                     * header in the future */
+  uint8_t flags;    /* Miscellaneous internal flags */
+  uint32_t pad[2];  /* Pad space for new fields */
+  uint32_t size;    /* Size of this message (including this header) */
+  char data[];      /* The actual user provided data */
 } __attribute__((packed));
 
 struct iptalk *new_iptalk(struct iptalk_config *config);
 void del_iptalk(struct iptalk *ipt);
 
-int iptalk_send(void *data, int len);
-int iptalk_recv(void *data, int len);
+ssize_t iptalk_sendmsg(struct iptalk *ipt, void *data, size_t len);
+
+//int iptalk_send(void *data, int len);
+//int iptalk_recv(void *data, int len);
 
 #ifndef IPTALK_XALLOC
 static inline void *_default_iptalk_xalloc(void *ptr, size_t sz)
 { return (!sz ? (free(ptr), NULL) : (!ptr ? malloc(sz) : realloc(ptr, sz))); }
 #define IPTALK_XALLOC(PTR, SZ) _default_iptalk_xalloc(PTR, SZ)
 #endif
+struct iptalk_convo *find_iptalk_convo(struct iptalk *ipt, int sock)
+{
+  iptalk_list_for(convo_ent, &ipt->convos) {
+    /* TODO use container_of */
+    struct iptalk_convo *convo = (void*)convo_ent;
+    if(convo->sock < 0)
+      continue;
+    if(convo->sock == sock)
+      return convo;
+  }
+  return NULL;
+}
+
+/*
+ * IPTALK List
+ */
+
+static inline 
+void iptalk_list_init(struct iptalk_list_head *list)
+{
+  list->next = list->prev = list;
+}
+
+static inline
+void iptalk_list_add(struct iptalk_list_head *new, struct iptalk_list_head *head) 
+{
+  head->prev->next = new;
+  new->prev = head->prev;
+  new->next = head;
+  head->prev = new;
+}
+
+static inline
+void iptalk_list_del(struct iptalk_list_head *entry)
+{
+  entry->next->prev = entry->prev;
+  entry->prev->next = entry->next;
+  entry->prev = entry->next = entry;
+}
+
+
+/* 
+ * IPTALK Buffer
+ */
+
+struct iptalk_buffer *new_iptalk_buffer() 
+{
+  struct iptalk_buffer *buffer = 
+    IPTALK_XALLOC(NULL, sizeof(struct iptalk_buffer));
+  memset(buffer, 0, sizeof(*buffer));
+
+  return buffer;
+}
+
+struct iptalk_buffer *del_iptalk_buffer(struct iptalk_buffer *buffer)
+{
+  if(buffer->list.next)
+    iptalk_list_del(&buffer->list);
+  if(buffer->data)
+    buffer->data = IPTALK_XALLOC(buffer->data, 0);
+  buffer = IPTALK_XALLOC(buffer, 0);
+}
+
+int realloc_iptalk_buffer(struct iptalk_buffer *buffer, size_t new_size)
+{
+  /* TODO: Can't go bigger than UINT32_MAX */
+  if(new_size <= buffer->size)
+    return 0;
+  buffer->size = new_size;
+  buffer->data = IPTALK_XALLOC(buffer->data, buffer->size);
+  /* TODO: error handle */
+  assert(buffer->data);
+  return 0;
+}
+
+ssize_t append_to_iptalk_buffer(
+    struct iptalk_buffer *buffer, const void *data, size_t size)
+{
+  realloc_iptalk_buffer(buffer, buffer->offset + size);
+  memcpy(buffer->data + buffer->offset, data, size);
+  buffer->offset += size;
+  assert(buffer->offset <= buffer->size);
+  return size;
+}
+
+ssize_t recv_to_iptalk_buffer(
+    struct iptalk_buffer *buffer, int sock, size_t n)
+{
+  realloc_iptalk_buffer(buffer, buffer->offset + n);
+  int left = buffer->size - buffer->offset;
+  assert(left >= n);
+  ssize_t received =  recv(sock, buffer->data + buffer->offset, n, 0);
+  if(received > 0) {
+    buffer->offset += received;
+  }
+  return received;
+}
+
+
+/*
+ * IPTALK Convo
+ */
 
 struct iptalk_convo *new_iptalk_convo(struct iptalk *ipt)
 {
-  ipt->num_convos += 1;
-  int sz = (ipt->num_convos * sizeof(struct iptalk_convo));
-  ipt->convos = IPTALK_XALLOC(ipt->convos, sz);
-  assert(ipt->convos);
-  return &ipt->convos[ipt->num_convos - 1];
+  struct iptalk_convo *convo = IPTALK_XALLOC(NULL, sizeof(struct iptalk_convo));
+  assert(convo);
+  memset(convo, 0, sizeof(convo));
+  iptalk_list_add(&convo->list, &ipt->convos);
+  convo->iptalk = ipt;
+  iptalk_list_init(&convo->buffers);
+  //IPTALK_DEBUG_PRINT("New convo %p", convo);
+  return convo;
 }
 
-struct iptalk_convo *find_iptalk_convo_by_socket(struct iptalk *ipt, int sock)
+
+
+void close_iptalk_convo(struct iptalk_convo *convo)
 {
-  for(int i = 0; i < ipt->num_convos; ++i) {
-    if(ipt->convo[i].sock == sock)
-      return &ipt->convo[i];
+  IPTALK_DEBUG_PRINT("Close iptalk convo %p\n", convo);
+  struct iptalk *ipt = convo->iptalk;
+  if(epoll_ctl(ipt->epoll_sock, EPOLL_CTL_DEL, convo->sock, NULL)) {
+    perror("epoll_ctl()");
   }
-  return NULL;
+  if(close(convo->sock)) {
+    perror("close()");
+  }
+  convo->sock = -1;
+}
+
+void del_iptalk_convo(struct iptalk_convo *convo)
+{
+  if(convo->sock >= 0) {
+    close_iptalk_convo(convo);
+  }
+  iptalk_list_safe_for(buffer_ent, &convo->buffers) {
+    struct iptalk_buffer *buffer = (void*)buffer_ent;
+    del_iptalk_buffer(buffer);
+  }
+  if(convo->list.next)
+    iptalk_list_del(&convo->list);
+  IPTALK_XALLOC(convo, 0);
+}
+
+struct iptalk_buffer * get_iptalk_convo_buffer(struct iptalk_convo *convo)
+{
+  if(!convo->current_buffer) {
+    convo->current_buffer = new_iptalk_buffer();
+  }
+  return convo->current_buffer;
+}
+
+int discard_iptalk_convo_buffer(struct iptalk_convo *convo)
+{
+  if(!convo->current_buffer)
+    return -1;
+
+  del_iptalk_buffer(convo->current_buffer);
+  return 0;
+}
+
+
+int commit_iptalk_convo_buffer(struct iptalk_convo *convo)
+{
+  /* TODO sanity check the buffer */
+  iptalk_list_add(&convo->current_buffer->list, &convo->buffers);
+  convo->current_buffer = NULL;
+  return 0;
+}
+
+
+int parse_iptalk_convo_buffer(struct iptalk_convo *convo) 
+{
+  int ret = -1;
+  struct iptalk_buffer *buffer = NULL;
+again:
+  buffer = get_iptalk_convo_buffer(convo);
+  /* Parse buffer header if it hasn't been parsed yet 
+   */
+  if(!buffer->header && buffer->offset >= sizeof(*buffer->header)) {
+    buffer->header = (struct iptalk_header*)buffer->data;
+
+    if(be16toh(buffer->header->magic) != IPTALK_MESSAGE_MAGIC) {
+      fprintf(stderr, "Bad magic\n");
+      discard_iptalk_convo_buffer(convo);
+      goto out;
+    }
+    if(buffer->header->version != 1) {
+      fprintf(stderr, "Unsupported version\n");
+      discard_iptalk_convo_buffer(convo);
+      goto out;
+    }
+  }
+
+  /* Have we got the full message?
+   */
+  buffer->header = (struct iptalk_header*)buffer->data;
+  if(buffer->offset >= buffer->header->size) {
+    if(!buffer->header) {
+      fprintf(stderr, "Invalid message\n");
+      goto out;
+    }
+    IPTALK_DEBUG_PRINT("GOTMSG %d %d\n", 
+        buffer->offset, buffer->header->size);
+    commit_iptalk_convo_buffer(convo);
+    int remainder = buffer->offset - buffer->header->size;
+    if(remainder) {
+      struct iptalk_buffer *new_buffer = get_iptalk_convo_buffer(convo);
+      assert(new_buffer != buffer);
+      append_to_iptalk_buffer(new_buffer, 
+          buffer->data + buffer->header->size, remainder);
+      goto again;
+    }
+  }
+  ret = 0;
+out:
+  return ret;
 }
 
 int get_iptalk_socket(struct iptalk *ipt)
@@ -116,65 +398,48 @@ int get_iptalk_socket(struct iptalk *ipt)
   return ipt->epoll_sock;
 }
 
-
-int _init_unix_iptalk(struct iptalk *ipt)
+int _init_unix_iptalk_client(struct iptalk *ipt)
 {
   int ret = -1;
 
-  if(ipt->config.unix.server) {
-    /* Because we are connection oriented server we will accept end up with
-     * one listening socket and possibly multiple connection sockets.
-     *
-     * Now lets say that the user wants to poll on us, what do we do?
-     * TODO: finish
-     */
+  ipt->sock = socket(AF_UNIX, SOCK_STREAM, 0);
+  if(ipt->sock < 0) {
+    perror("socket()");
+    goto out;
+  }
 
-    ipt->epoll_sock = epoll_create(1);
-    if(ipt->epoll_sock < 0) {
-      perror("epoll_create()");
-      goto out;
-    }
+  char tempfile[] = "/tmp/iptalk.XXXXXX";
+  int tempfd = -1;
+  if((tempfd = mkstemp(tempfile)) < 0) {
+    perror("mkstemp()");
+    goto out;
+  } else {
+    close(tempfd);
+  }
+  /* TODO: make safe */
+  strcpy(ipt->unix.tempfile, tempfile);
 
-    ipt->sock = socket(AF_UNIX, SOCK_STREAM, 0);
-    if(ipt->sock < 0) {
-      perror("socket()");
-      goto out;
-    }
+  ipt->unix.local.sun_family = AF_UNIX;
+  unlink(tempfile);
+  strcpy(ipt->unix.local.sun_path, tempfile);
 
-    ipt->unix.local.sun_family = AF_UNIX;
-    unlink(ipt->config.unix.filename);
-    strcpy(ipt->unix.local.sun_path, ipt->config.unix.filename);
+  ipt->unix.remote.sun_family = AF_UNIX;
+  strcpy(ipt->unix.remote.sun_path, ipt->config.unix.filename);
 
-    if(bind(ipt->sock, 
+  if(bind(ipt->sock, 
           (struct sockaddr*)&ipt->unix.local, 
           sizeof(ipt->unix.local))) 
-    {
-      perror("bind()");
-      goto out;
-    }
+  {
+    perror("bind()");
+    goto out;
+  }
 
-    /* TODO: use config.backlog */
-    if(listen(ipt->sock, 10)) {
-      perror("listen()");
-      goto out;
-    }
-
-    int flags = fcntl(ipt->sock, F_GETFL, 0);
-    if(flags < 0 || fcntl(ipt->sock, F_SETFL, flags | O_NONBLOCK)) {
-      perror("fcntl()");
-      goto out;
-    }
-
-    struct epoll_event event = {
-      .events = EPOLLIN,
-      .data = { .fd = ipt->sock, }
-    };
-    if(epoll_ctl(ipt->epoll_sock, EPOLL_CTL_ADD, ipt->sock, &event)) {
-      perror("epoll_ctl()");
-      goto out;
-    }
-  } else {
-    assert(0);
+  if(connect(ipt->sock, 
+        (struct sockaddr*)&ipt->unix.remote, 
+        sizeof(ipt->unix.remote)))
+  {
+    perror("connect()");
+    goto out;
   }
 
   ret = 0;
@@ -182,26 +447,119 @@ out:
   return ret;
 }
 
+
+int _init_unix_iptalk_server(struct iptalk *ipt)
+{
+  int ret = -1;
+  /* Because we are connection oriented server we will accept end up with
+   * one listening socket and possibly multiple connection sockets.
+   *
+   * Now lets say that the user wants to poll on us, what do we do?
+   * TODO: finish
+   */
+  ipt->epoll_sock = epoll_create(1);
+  if(ipt->epoll_sock < 0) {
+    perror("epoll_create()");
+    goto out;
+  }
+
+  ipt->sock = socket(AF_UNIX, SOCK_STREAM, 0);
+  if(ipt->sock < 0) {
+    perror("socket()");
+    goto out;
+  }
+
+  ipt->unix.local.sun_family = AF_UNIX;
+  /* TODO: Make sure the name isn't too long */
+  unlink(ipt->config.unix.filename);
+  strcpy(ipt->unix.local.sun_path, ipt->config.unix.filename);
+
+  if(bind(ipt->sock, 
+        (struct sockaddr*)&ipt->unix.local, 
+        sizeof(ipt->unix.local))) 
+  {
+    perror("bind()");
+    goto out;
+  }
+
+  /* TODO: use config.backlog */
+  if(listen(ipt->sock, 10)) {
+    perror("listen()");
+    goto out;
+  }
+
+  int flags = fcntl(ipt->sock, F_GETFL, 0);
+  if(flags < 0 || fcntl(ipt->sock, F_SETFL, flags | O_NONBLOCK)) {
+    perror("fcntl()");
+    goto out;
+  }
+
+  struct epoll_event event = {
+    .events = EPOLLIN,
+    .data = { .fd = ipt->sock, }
+  };
+  if(epoll_ctl(ipt->epoll_sock, EPOLL_CTL_ADD, ipt->sock, &event)) {
+    perror("epoll_ctl()");
+    goto out;
+  }
+
+  IPTALK_DEBUG_PRINT("ipt=%p sock=%d epoll_sock=%d local='%s'", 
+      ipt, ipt->epoll_sock, ipt->sock, ipt->unix.local.sun_path);
+
+  ret = 0;
+out:
+  return ret;
+}
+
+
+
+void del_iptalk(struct iptalk *iptalk) 
+{
+  if(iptalk->epoll_sock >= 0)
+    iptalk->epoll_sock = (close(iptalk->epoll_sock), -1);
+
+  if(iptalk->sock >= 0)
+    iptalk->sock = (close(iptalk->sock), -1);
+
+  iptalk_list_safe_for(convo_ent, &iptalk->convos) {
+    struct iptalk_convo *convo = (void*)convo_ent;
+    del_iptalk_convo(convo);
+  }
+  if(iptalk->config.type == IPTALK_UNIX) {
+    if(iptalk->unix.tempfile[0]) {
+      unlink(iptalk->unix.tempfile);
+    }
+  }
+  IPTALK_XALLOC(iptalk, 0);
+}
+
 struct iptalk *new_iptalk(struct iptalk_config *config)
 {
   struct iptalk *ipt = IPTALK_XALLOC(NULL, sizeof(struct iptalk));
   if(!ipt)
     return NULL;
-
+  
   ipt->config = *config;
+  iptalk_list_init(&ipt->convos);
 
   switch(ipt->config.type) {
     case IPTALK_UNIX:
-      if(_init_unix_iptalk(ipt))
-        goto err;
+      if(ipt->config.unix.server) {
+        if(_init_unix_iptalk_server(ipt))
+          goto err;
+      } else {
+        if(_init_unix_iptalk_client(ipt))
+          goto err;
+      }
       break;
     default:
       goto err;
   }
 
+  IPTALK_DEBUG_PRINT("ipt=%p", ipt);
   return ipt;
 err:
-  return IPTALK_XALLOC(ipt, 0);
+  return (del_iptalk(ipt), NULL);
 }
 
 #define IPTALK_MAX_EVENTS 128
@@ -212,17 +570,19 @@ int iptalk_tick(struct iptalk *ipt)
 
   struct epoll_event events[IPTALK_MAX_EVENTS];
   int num_events = epoll_wait(ipt->epoll_sock, events, IPTALK_MAX_EVENTS, 0);
-  printf("num_events=%d\n", num_events);
+
   if(num_events < 0) {
     perror("epoll_wait()");
     goto out; 
   }
 
   for(int i = 0; i < num_events; ++i) {
+    //printf("epoll event fd=%d flags=%d\n", events[i].data.fd, events[i].events);
+    struct iptalk_convo *convo = NULL;
     /* If we are a server and the socket is the listening socket
      * try accept a new connection */
     if(ipt->config.unix.server && events[i].data.fd == ipt->sock) {
-      struct iptalk_convo *convo = new_iptalk_convo(ipt);
+      convo = new_iptalk_convo(ipt);
       /* TODO: get the peer address into convo */
       convo->sock = accept(ipt->sock, NULL, NULL);
       if(convo->sock < 0) {
@@ -238,18 +598,62 @@ int iptalk_tick(struct iptalk *ipt)
         perror("epoll_ctl()");
         goto out;
       }
-
-      printf("New convo %d\n", convo->sock);
-      continue;
+      continue ;
     }
 
+    if(events[i].events & EPOLLIN) {
+      convo = find_iptalk_convo(ipt, events[i].data.fd);
+      if(!convo) {
+        fprintf(stderr, "No conversation.\n");
+        continue;
+      }
+      struct iptalk_buffer *buffer = get_iptalk_convo_buffer(convo);
 
-    printf("%d readable\n", events[i].data.fd);
+      ssize_t received = recv_to_iptalk_buffer(buffer, convo->sock, 2048);
+      if(received < 0) {
+        perror("recv()");
+        continue;
+      }
+
+      //IPTALK_DEBUG_PRINT("Receive %d buf=%p offset=%d", 
+      //              received, buffer, buffer->offset);
+      if(received == 0) {
+        /* Convo ended */
+        close_iptalk_convo(convo);
+        continue;
+      }
+      
+      if(parse_iptalk_convo_buffer(convo)) {
+        fprintf(stderr, "Failed to parse the message.");
+        continue;
+      }
+    }
   }
 
   ret = 0;
 out:
   return ret;
+}
+
+ssize_t iptalk_sendmsg(struct iptalk *ipt, void *data, size_t len)
+{
+  ssize_t rc = -1;
+  /* TODO: check size against max uint32 */
+  struct iptalk_header header = {
+    .magic = htobe16(IPTALK_MESSAGE_MAGIC),
+    .version = 1,
+    .flags = 0,
+    .size = sizeof(header) + len,
+  };
+  rc = send(ipt->sock, &header, sizeof(header), 0);
+  if(rc != sizeof(header))
+    return -1;
+
+  rc = send(ipt->sock, data, len, 0);
+  if(rc != sizeof(len))
+    return -1;
+
+  return 0;
 }
 
 #endif /* _IPTALK_H_ */
