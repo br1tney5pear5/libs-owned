@@ -115,11 +115,17 @@ struct iptalk_convo {
 
   struct iptalk_buffer *current_buffer;
   struct iptalk_list_head buffers;
+  
+  void *user_data;
 };
 
 struct iptalk {
   int epoll_sock;
   int sock;
+
+  /* Only filled on for the client, server doesn't have a
+   * main convo */
+  struct iptalk_convo *main_convo;
 
   struct iptalk_list_head convos;
   struct iptalk_list_head events;
@@ -148,11 +154,12 @@ struct iptalk_header {
 } __attribute__((packed));
 
 
+#define _BIT(N) (1 << (N))
 enum {
-  IPTALK_EVENT_INVALID = 0,
-  IPTALK_EVENT_CONVO_STARTED,
-  IPTALK_EVENT_CONVO_ENDED,
-  IPTALK_EVENT_MESSAGE_RECEIVED,
+  IPTALK_EVENT_INVALID              = 0,
+  IPTALK_EVENT_CONVO_STARTED        = _BIT(0),
+  IPTALK_EVENT_CONVO_ENDED          = _BIT(1),
+  IPTALK_EVENT_MESSAGE_RECEIVED     = _BIT(2),
 };
 
 struct iptalk_event {
@@ -166,7 +173,7 @@ struct iptalk_event {
   };
 };
 
-#define iptalk_events_for(EVENT, IPTALK)\
+#define foreach_iptalk_event(EVENT, IPTALK)\
   for(struct iptalk_event *EVENT = next_iptalk_event(IPTALK, NULL);\
       EVENT; EVENT = next_iptalk_event(IPTALK, EVENT))
 
@@ -180,7 +187,7 @@ void del_iptalk(struct iptalk *ipt);
 
 /* Send message over iptalk (XXX: semantics might change)
  */
-ssize_t iptalk_sendmsg(struct iptalk *ipt, void *data, size_t len);
+ssize_t iptalk_sendmsg(struct iptalk_convo *convo, void *data, size_t len);
 
 /* 
  */
@@ -190,6 +197,10 @@ struct iptalk_event *next_iptalk_event(
 /* Delete handled iptalk event 
  */
 void del_iptalk_event(struct iptalk_event *event);
+
+/* Gather events basically
+ */
+int iptalk_tick(struct iptalk *iptalk);
 
 #endif /* _IPTALK_H_ */
 
@@ -212,6 +223,7 @@ void del_iptalk_event(struct iptalk_event *event);
 #include <unistd.h>
 #include <fcntl.h>
 #include <endian.h>
+#include <time.h>
 
 /* You can overwrite IPTALK_XALLOC to implement a custom allocator 
  */
@@ -415,9 +427,7 @@ int discard_iptalk_convo_buffer(struct iptalk_convo *convo)
   del_iptalk_buffer(convo->current_buffer);
   return 0;
 }
-
-void del_iptalk_convo(struct iptalk_convo *convo)
-{
+void del_iptalk_convo(struct iptalk_convo *convo) {
   if(convo->sock >= 0) {
     close_iptalk_convo(convo);
   }
@@ -562,6 +572,9 @@ int _init_unix_iptalk_client(struct iptalk *ipt)
     goto out;
   }
 
+  ipt->main_convo = new_iptalk_convo(ipt);
+  ipt->main_convo->sock = ipt->sock;
+
   ret = 0;
 out:
   return ret;
@@ -577,12 +590,6 @@ int _init_unix_iptalk_server(struct iptalk *ipt)
    * Now lets say that the user wants to poll on us, what do we do?
    * TODO: finish
    */
-  ipt->epoll_sock = epoll_create(1);
-  if(ipt->epoll_sock < 0) {
-    perror("epoll_create()");
-    goto out;
-  }
-
   ipt->sock = socket(AF_UNIX, SOCK_STREAM, 0);
   if(ipt->sock < 0) {
     perror("socket()");
@@ -613,16 +620,6 @@ int _init_unix_iptalk_server(struct iptalk *ipt)
     perror("fcntl()");
     goto out;
   }
-
-  struct epoll_event event = {
-    .events = EPOLLIN,
-    .data = { .fd = ipt->sock, }
-  };
-  if(epoll_ctl(ipt->epoll_sock, EPOLL_CTL_ADD, ipt->sock, &event)) {
-    perror("epoll_ctl()");
-    goto out;
-  }
-
   IPTALK_DEBUG_PRINT("ipt=%p sock=%d epoll_sock=%d local='%s'", 
       ipt, ipt->epoll_sock, ipt->sock, ipt->unix.local.sun_path);
 
@@ -652,6 +649,11 @@ void del_iptalk(struct iptalk *iptalk)
       unlink(iptalk->unix.tempfile);
     }
   }
+  /* Invalidate as much as possible */
+  memset(iptalk, 0, sizeof(*iptalk));
+  iptalk->sock = -1;
+  iptalk->epoll_sock = -1;
+
   IPTALK_XALLOC(iptalk, 0);
 }
 
@@ -664,6 +666,13 @@ struct iptalk *new_iptalk(struct iptalk_config *config)
   ipt->config = *config;
   iptalk_list_init(&ipt->convos);
   iptalk_list_init(&ipt->events);
+
+  ipt->epoll_sock = epoll_create(1);
+  IPTALK_DEBUG_PRINT("epoll_sock=%d", ipt->epoll_sock);
+  if(ipt->epoll_sock < 0) {
+    perror("epoll_create()");
+    goto err;
+  }
 
   switch(ipt->config.type) {
     case IPTALK_UNIX:
@@ -679,6 +688,15 @@ struct iptalk *new_iptalk(struct iptalk_config *config)
       goto err;
   }
 
+  struct epoll_event event = {
+    .events = EPOLLIN,
+    .data = { .fd = ipt->sock, }
+  };
+  if(epoll_ctl(ipt->epoll_sock, EPOLL_CTL_ADD, ipt->sock, &event)) {
+    perror("epoll_ctl()");
+    goto err;
+  }
+
   IPTALK_DEBUG_PRINT("ipt=%p", ipt);
   return ipt;
 err:
@@ -686,6 +704,40 @@ err:
 }
 
 #define IPTALK_MAX_EVENTS 128
+
+int iptalk_wait(struct iptalk *iptalk, int timeout)
+{
+  struct epoll_event epoll_event = {0};
+  int rc = epoll_wait(iptalk->epoll_sock, &epoll_event, 1, timeout);
+  iptalk_tick(iptalk);
+  return rc;
+}
+
+
+long int _time_now()
+{
+  struct timespec time = {0};
+  clock_gettime(CLOCK_MONOTONIC, &time);
+  long int result =  time.tv_sec * 1000 + time.tv_nsec / (1000000LL);
+  printf("%ld %ld %ld\n", time.tv_sec, time.tv_nsec, result);
+  return time.tv_sec * 1000 + time.tv_nsec / (1000000LL);
+}
+
+int iptalk_wait_for(struct iptalk *iptalk, int timeout, uint32_t mask)
+{
+  long int deadline = _time_now() + timeout;
+  while(true) {
+    long int left = deadline - _time_now();
+    IPTALK_DEBUG_PRINT("left=%ld", left);
+    if(left <= 0) break;
+    iptalk_wait(iptalk, left);
+    foreach_iptalk_event(event, iptalk) {
+      if(event->type & mask)
+        return 0;
+    }
+  }
+  return -1;
+}
 
 int iptalk_tick(struct iptalk *iptalk)
 {
@@ -708,14 +760,14 @@ int iptalk_tick(struct iptalk *iptalk)
 
   struct epoll_event events[IPTALK_MAX_EVENTS];
   int num_events = epoll_wait(iptalk->epoll_sock, events, IPTALK_MAX_EVENTS, 0);
-
+  IPTALK_DEBUG_PRINT("sock=%d num_events=%d\n", iptalk->epoll_sock, num_events);
   if(num_events < 0) {
     perror("epoll_wait()");
     goto out; 
   }
 
   for(int i = 0; i < num_events; ++i) {
-    //printf("epoll event fd=%d flags=%d\n", events[i].data.fd, events[i].events);
+    printf("epoll event fd=%d flags=%d\n", events[i].data.fd, events[i].events);
     struct iptalk_convo *convo = NULL;
     /* If we are a server and the socket is the listening socket
      * try accept a new connection */
@@ -773,7 +825,7 @@ out:
   return ret;
 }
 
-ssize_t iptalk_sendmsg(struct iptalk *ipt, void *data, size_t len)
+ssize_t iptalk_sendmsg(struct iptalk_convo *convo, void *data, size_t len)
 {
   ssize_t rc = -1;
   /* TODO: check size against max uint32 */
@@ -783,11 +835,11 @@ ssize_t iptalk_sendmsg(struct iptalk *ipt, void *data, size_t len)
     .flags = 0,
     .size = sizeof(header) + len,
   };
-  rc = send(ipt->sock, &header, sizeof(header), 0);
+  rc = send(convo->sock, &header, sizeof(header), 0);
   if(rc != sizeof(header))
     return -1;
 
-  rc = send(ipt->sock, data, len, 0);
+  rc = send(convo->sock, data, len, 0);
   if(rc != sizeof(len))
     return -1;
 
