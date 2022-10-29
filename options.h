@@ -1,3 +1,6 @@
+#ifndef _OPTS_H_
+#define _OPTS_H_
+
 #include <stddef.h>
 #include <stdlib.h>
 #include <string.h>
@@ -7,12 +10,10 @@
 #include <assert.h>
 
 #ifndef OPT_XALLOC
-void *_default_opt_xalloc(void *ptr, size_t sz)
-{
-  return (!sz ? (free(ptr), NULL) : (!ptr ? malloc(sz) : realloc(ptr, sz)));
-}
 #define OPT_XALLOC(PTR, SZ) _default_opt_xalloc(PTR, SZ)
 #endif
+
+
 
 #define OPT_DEBUG(P, ...)\
   if((P)->config.debug_prints) {\
@@ -69,8 +70,6 @@ struct option {
    */
   int off_params;
   int num_params;
-
-  /* TODO: add option category for help like grep */
   union {
     void      *params;    
     char     **string_params;
@@ -94,6 +93,7 @@ struct option_parser_config {
   bool debug_prints;
 };
 
+static
 struct option_parser_config _default_option_parser_config = {
   .custom = false,
   .short_prefix = "-",
@@ -105,7 +105,7 @@ struct option_parser_config _default_option_parser_config = {
 };
 
 #define options_for(OPT, OPTS)\
-    for(struct option *OPT = OPTS; OPT->name || OPT->short_name; OPT++)
+    for(struct option *OPT = OPTS; OPT->name; OPT++)
 
 struct option_parser {
   bool initialised;
@@ -133,9 +133,25 @@ struct option_parser {
   struct option_parser_config config;
 };
 
-float get_option_value_as_float(struct option *opt);
-int get_option_value_as_integer(struct option *opt);
-char* get_option_value_as_string(struct option *opt);
+int parse_options_incrementally(
+    struct option_parser *p, struct option *options, int argc, char **argv);
+
+void print_options_help(FILE *out, struct option *options);
+
+#endif /* _OPTS_H_ */
+
+/* 
+ * 
+ * Implementation 
+ *
+ */
+
+#ifdef OPTS_IMPL
+static
+void *_default_opt_xalloc(void *ptr, size_t sz)
+{
+  return (!sz ? (free(ptr), NULL) : (!ptr ? malloc(sz) : realloc(ptr, sz)));
+}
 
 char *unprefix_argument(char *arg, char *prefix)
 {
@@ -607,3 +623,5 @@ void print_options_help(FILE *out, struct option *options)
   }
 }
 
+
+#endif /* _IMPL_OPTS_ */
